@@ -1,19 +1,30 @@
 // Canvas candlestick renderer: candles + volume, overlay plots on the
 // price pane, one sub-pane per non-overlay script, crosshair with OHLC
-// readout, last-price line. Interaction: drag (mouse or touch) pans the
-// candle window left/right, wheel/pinch zooms, the on-chart ‹ › buttons
-// pan one step at a time, arrow keys pan, and double-click or the
-// "Terbaru" button jumps back to the latest candle. Dragging vertically
-// on the right-hand price axis rescales the price range TradingView-
-// style (up stretches the candles taller, down flattens them); while a
-// manual scale is active the main pane stops auto-fitting, and the
-// "Skala auto" button, a double-click, or Home restores auto scale.
+// readout, last-price line. Interaction: drag (mouse or touch) on the
+// candle area pans in both directions at once — horizontally it pans
+// the candle window left/right, including past the latest candle into
+// the empty future space on the right, TradingView-style (the view
+// offset may go negative); vertically it translates the visible price
+// range up/down WITHOUT changing the price scale (the candles ride
+// with the pointer). The vertical shift is stored as a manual range
+// with the auto-fit span, so it persists across live refetches until
+// the view is reset. Wheel/pinch zooms, the on-chart ‹ › buttons pan
+// one step at a time, arrow keys pan, and double-click or the
+// "Terbaru" button jumps back to the latest candle. The "Ukur rentang"
+// tool measures a date & price range: drag on the chart and it draws
+// the range box with the price change, % change, bar count, and
+// duration. Dragging vertically on the right-hand price axis rescales
+// the price range TradingView-style (up stretches the candles taller,
+// down flattens them); while a manual scale is active the main pane
+// stops auto-fitting, and the "Skala auto" button, a double-click, or
+// Home restores auto scale.
 // Pointer handling is attached natively (not via React props) so a drag
 // keeps tracking even while live refetches re-render the panel
 // mid-gesture.
 
 import { useEffect, useRef, useState } from "react";
 import type { Candle, PlotOutput } from "./pine";
+import { COL_ASK, COL_BID, pxPrice, type LiquidityData } from "./liquidity";
 
 export type PaneGroup = {
   name: string;
@@ -43,7 +54,26 @@ function fmtAxis(v: number): string {
   return v.toFixed(5);
 }
 
-type View = { count: number; offset: number }; // offset = bars hidden past the right edge
+/** #RRGGBB + alpha → rgba() string, for the ladder/wall translucency. */
+function hexA(hex: string, alpha: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${Math.max(0, Math.min(1, alpha))})`;
+}
+
+type View = { count: number; offset: number }; // offset = bars hidden past the right edge; negative = empty future bars shown past the latest candle
+
+function fmtDuration(ms: number): string {
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec} dtk`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} mnt`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return min % 60 ? `${hr} jam ${min % 60} mnt` : `${hr} jam`;
+  const day = Math.floor(hr / 24);
+  return hr % 24 ? `${day} hari ${hr % 24} jam` : `${day} hari`;
+}
 
 export type ChartType = "candles" | "heikin" | "renko";
 
@@ -124,37 +154,81 @@ export function ChartView({
   overlayPlots,
   panes,
   height,
+  onNeedMore,
+  liquidity,
 }: {
   candles: Candle[];
   overlayPlots: PlotOutput[];
   panes: PaneGroup[];
   height: number;
+  // Called whenever the view sits at the oldest loaded candle, so the
+  // parent can page in older history. The parent guards the call
+  // (no-op while a page is loading or history is exhausted/capped).
+  onNeedMore?: () => void;
+  // Liquidity Master (real order book): depth ladder + wall lines,
+  // drawn over the main pane when present and ready.
+  liquidity?: LiquidityData | null;
 }) {
+  const needMoreRef = useRef(onNeedMore);
+  needMoreRef.current = onNeedMore;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<View>({ count: 90, offset: 0 });
   const hoverRef = useRef<{ x: number; y: number } | null>(null);
-  const dataRef = useRef({ candles, overlayPlots, panes });
-  dataRef.current = { candles, overlayPlots, panes };
+  const dataRef = useRef({ candles, overlayPlots, panes, liquidity });
+  dataRef.current = { candles, overlayPlots, panes, liquidity };
   const drawRef = useRef<(() => void) | null>(null);
   // Interaction state lives in refs (not effect-local variables) so an
   // in-progress drag survives the effect re-running on live refetches.
   const pointersRef = useRef(new Map<number, { x: number; y: number }>());
-  const dragStartRef = useRef<{ x: number; offset: number } | null>(null);
+  // Drag snapshot for a plot-area drag: horizontal pans the time
+  // offset, vertical translates the price range. `center`/`span` are
+  // the effective price range at drag start (from the manual scale
+  // when one is active, else the padded auto-fit range); center is
+  // null when no range is known yet, disabling the vertical part.
+  const dragStartRef = useRef<{
+    x: number;
+    y: number;
+    offset: number;
+    center: number | null;
+    span: number;
+  } | null>(null);
   const pinchStartRef = useRef<{ dist: number; count: number } | null>(null);
   const [panned, setPanned] = useState(false);
   const pannedRef = useRef(false);
-  // Manual vertical price scale (TradingView axis drag). `base` is the
-  // auto-fit span at the moment scaling started, kept only as a sane
+  // Manual price range for the main pane. Created either by a
+  // TradingView-style axis drag (changes `span` = vertical zoom) or by
+  // dragging the candle area vertically (changes only `center` = a
+  // pure price translation, span untouched). `base` is the auto-fit
+  // span at the moment the manual range started, kept only as a sane
   // clamp range; null scale = auto-fit.
   const scaleRef = useRef<{ center: number; span: number; base: number } | null>(null);
   const autoRangeRef = useRef<{ lo: number; hi: number } | null>(null);
   const scaleDragRef = useRef<{ lastY: number } | null>(null);
   const [scaled, setScaled] = useState(false);
   const scaledRef = useRef(false);
+  // Date & price range measurement ("Rentang tanggal dan harga").
+  // Points are anchored to bar index + price (not pixels) so the box
+  // stays on its candles while the view pans/zooms or data refetches.
+  type MeasurePoint = { idx: number; price: number };
+  const measureRef = useRef<{ start: MeasurePoint; end: MeasurePoint } | null>(null);
+  const measureDragRef = useRef(false);
+  const measureModeRef = useRef(false);
+  const [measureMode, setMeasureModeState] = useState(false);
+  const [hasMeasure, setHasMeasure] = useState(false);
+  const setMeasureMode = (on: boolean) => {
+    measureModeRef.current = on;
+    setMeasureModeState(on);
+  };
+  const clearMeasure = () => {
+    measureRef.current = null;
+    measureDragRef.current = false;
+    setHasMeasure(false);
+    drawRef.current?.();
+  };
 
   const syncPanned = () => {
-    const p = viewRef.current.offset > 0;
+    const p = viewRef.current.offset !== 0;
     if (p !== pannedRef.current) {
       pannedRef.current = p;
       setPanned(p);
@@ -164,8 +238,16 @@ export function ChartView({
     const n = dataRef.current.candles.length;
     return Math.max(0, n - Math.min(viewRef.current.count, Math.max(1, n)));
   };
+  // Panning right may overshoot the latest candle: up to count-1 empty
+  // future bars, so the last candle can be dragged almost to the left
+  // edge and the right side never feels "mentok" (stuck).
+  const minOffset = () => {
+    const n = dataRef.current.candles.length;
+    const count = Math.min(viewRef.current.count, Math.max(1, n));
+    return -(count - 1);
+  };
   const panBy = (deltaBars: number) => {
-    viewRef.current.offset = Math.max(0, Math.min(maxOffset(), viewRef.current.offset + deltaBars));
+    viewRef.current.offset = Math.max(minOffset(), Math.min(maxOffset(), viewRef.current.offset + deltaBars));
     syncPanned();
     drawRef.current?.();
   };
@@ -206,7 +288,7 @@ export function ChartView({
     if (!canvas || !wrap) return;
 
     const draw = () => {
-      const { candles: cs, overlayPlots: overlays, panes: subPanes } = dataRef.current;
+      const { candles: cs, overlayPlots: overlays, panes: subPanes, liquidity: liq } = dataRef.current;
       const w = wrap.clientWidth;
       const h = height;
       const dpr = window.devicePixelRatio || 1;
@@ -233,8 +315,13 @@ export function ChartView({
       const plotW = Math.max(50, w - AXIS_W);
       const n = cs.length;
       const count = Math.max(10, Math.min(view.count, n));
-      // Keep the panned window valid as live candles slide underneath it.
-      view.offset = Math.max(0, Math.min(view.offset, Math.max(0, n - count)));
+      // Keep the panned window valid as live candles slide underneath
+      // it. The lower bound is negative: the window may extend past the
+      // latest candle into empty future bars.
+      view.offset = Math.max(-(count - 1), Math.min(view.offset, Math.max(0, n - count)));
+      // Scrolled all the way to the oldest loaded candle: ask the
+      // parent to page in older history (auto-load on left edge).
+      if (view.offset >= Math.max(0, n - count)) needMoreRef.current?.();
       const end = Math.max(count, n - view.offset); // exclusive index
       const start = end - count;
       const barW = plotW / count;
@@ -304,6 +391,12 @@ export function ChartView({
       }
       const oRange = rangeOf(overlays);
       if (Number.isFinite(oRange.min)) { pMin = Math.min(pMin, oRange.min); pMax = Math.max(pMax, oRange.max); }
+      // The Liquidity Master ladder spans its full price range; like
+      // the original's boxes, it stretches the price scale to fit.
+      if (liq && liq.ready) {
+        pMin = Math.min(pMin, liq.base);
+        pMax = Math.max(pMax, liq.base + liq.nrow * liq.step);
+      }
       // Remember the padded auto-fit range: an axis drag starts manual
       // scaling from exactly the range currently on screen.
       if (Number.isFinite(pMin) && Number.isFinite(pMax) && pMax > pMin) {
@@ -489,6 +582,74 @@ export function ChartView({
       for (const p of overlays) if (p.kind === "fill") drawPlot(p, yMain, 0, mainH);
       for (const p of overlays) if (p.kind !== "fill") drawPlot(p, yMain, 0, mainH);
 
+      // ---- Liquidity Master: depth ladder over the last bars, wall
+      // lines with halos, and wall name labels — drawn like the
+      // original script's boxes/lines/labels (ladder width 30 bars,
+      // rows inset 7% of the row height, glow past t > 0.5, wall lines
+      // reaching 150 bars back).
+      if (liq && liq.ready && liq.hasLiquidity) {
+        const xR = x(n - 1);
+        const ladderW = Math.min(30 * barW, plotW * 0.5);
+        const brightMul = 0.4 + 0.2 * 3; // Brightness input default 3
+        for (const row of liq.rows) {
+          if (row.t < 0.03) continue;
+          const col = row.above ? COL_ASK : COL_BID;
+          const wd = Math.max(1, ladderW * row.t);
+          if (row.t > 0.5) {
+            ctx.fillStyle = hexA(col, (14 * row.t * brightMul) / 100);
+            ctx.fillRect(
+              xR - wd - 1,
+              yMain(row.y1 + liq.step * 0.2),
+              wd + 1,
+              Math.max(1, yMain(row.y0 - liq.step * 0.2) - yMain(row.y1 + liq.step * 0.2)),
+            );
+          }
+          const transp = Math.round(82 - 65 * Math.pow(row.t, 1.2) * brightMul);
+          const alpha = 1 - Math.min(Math.max(transp, 32), 90) / 100;
+          ctx.fillStyle = hexA(col, alpha);
+          const yTop = yMain(row.y1 - liq.step * 0.07);
+          const yBot = yMain(row.y0 + liq.step * 0.07);
+          ctx.fillRect(xR - wd, yTop, wd, Math.max(1, yBot - yTop));
+        }
+        // Ladder edge line.
+        ctx.strokeStyle = "rgba(42,46,57,0.5)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xR + 1, yMain(liq.base + liq.nrow * liq.step));
+        ctx.lineTo(xR + 1, yMain(liq.base));
+        ctx.stroke();
+        // Wall lines: soft halo (width 6 and 3, like the original's
+        // transp-86/72 companion lines) under a dotted main line.
+        const drawWall = (price: number, col: string, name: string) => {
+          const y = yMain(price);
+          if (y < -10 || y > mainH + 10) return;
+          const x1 = x(Math.max(start, n - 1 - 150));
+          ctx.strokeStyle = hexA(col, 0.14);
+          ctx.lineWidth = 6;
+          ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(xR, y); ctx.stroke();
+          ctx.strokeStyle = hexA(col, 0.28);
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(xR, y); ctx.stroke();
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 2]);
+          ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(xR, y); ctx.stroke();
+          ctx.setLineDash([]);
+          // Name label: pill (chart bg at 75%) with the wall name and
+          // price, ending at the ladder's right edge like the original.
+          const label = `${name} ${pxPrice(price)}`;
+          ctx.font = "11px 'JetBrains Mono', monospace";
+          const tw = ctx.measureText(label).width;
+          const lx = Math.max(2, xR - tw - 10);
+          ctx.fillStyle = "rgba(255,255,255,0.78)";
+          ctx.fillRect(lx - 4, y - 8, tw + 8, 16);
+          ctx.fillStyle = col;
+          ctx.fillText(label, lx, y + 4);
+        };
+        if (liq.wallUp) drawWall(liq.wallUp.price, COL_ASK, "sell wall");
+        if (liq.wallDn) drawWall(liq.wallDn.price, COL_BID, "buy wall");
+      }
+
       // ---- sub panes
       subPanes.forEach((pane, pi) => {
         const top = paneTops[pi] ?? mainH;
@@ -518,23 +679,29 @@ export function ChartView({
       ctx.fillStyle = AXIS_TEXT;
       ctx.font = "10px 'JetBrains Mono', monospace";
       const stepBars = Math.max(1, Math.round(64 / barW));
+      const lastCandle = cs[n - 1];
       for (let i = start; i < end; i += stepBars) {
         const c = cs[i];
-        if (!c) continue;
+        // Bars past the latest candle are empty future space: their
+        // time is extrapolated from the candle spacing so the axis
+        // keeps labeling while panned into the future.
+        const t = c ? c.time : lastCandle && spanMs > 0 ? lastCandle.time + (i - (n - 1)) * spanMs : null;
+        if (t == null) continue;
         ctx.strokeStyle = GRID;
         ctx.lineWidth = 0.5;
         ctx.beginPath(); ctx.moveTo(x(i), 0); ctx.lineTo(x(i), h - timeAxisH); ctx.stroke();
         ctx.lineWidth = 1;
-        const d = new Date(c.time);
+        const d = new Date(t);
         const label = spanMs >= 86400000
           ? d.toLocaleDateString("id-ID", { day: "2-digit", month: "short" })
           : d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
         ctx.fillText(label, x(i) - 14, h - 5);
       }
 
-      // ---- last price line + tag
+      // ---- last price line + tag (whenever the last candle is visible,
+      // including when the view is panned into the future space)
       const last = cs[n - 1];
-      if (last && view.offset === 0) {
+      if (last && start <= n - 1 && n - 1 < end) {
         const y = yMain(last.close);
         if (y >= 0 && y <= mainH) {
           ctx.strokeStyle = last.close >= last.open ? UP : DOWN;
@@ -548,6 +715,40 @@ export function ChartView({
           ctx.fillText(fmtAxis(last.close), plotW + 5, y + 3);
         }
       }
+
+      // ---- crosshair time chip: full date & time label centered
+      // under the crosshair in the time-axis strip, TradingView-style.
+      // Follows the cursor wherever it moves (real candles and the
+      // empty future space alike).
+      const drawTimeChip = (cxPos: number, t: number) => {
+        const d = new Date(t);
+        const datePart = d
+          .toLocaleDateString("id-ID", {
+            weekday: "short",
+            day: "numeric",
+            month: "short",
+            year: "2-digit",
+          })
+          .replace(/,/g, "");
+        const label =
+          spanMs >= 86400000
+            ? datePart
+            : `${datePart} ${d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}`;
+        ctx.font = "bold 10px 'JetBrains Mono', monospace";
+        const tw = ctx.measureText(label).width;
+        const chipW = tw + 14;
+        const chipH = 16;
+        const chipY = h - timeAxisH + (timeAxisH - chipH) / 2;
+        // Keep the whole chip inside the plot area at both edges.
+        const chipX = Math.max(0, Math.min(Math.max(0, plotW - chipW), cxPos - chipW / 2));
+        ctx.fillStyle = "#111827";
+        ctx.fillRect(chipX, chipY, chipW, chipH);
+        ctx.fillStyle = "#ffffff";
+        const prevAlign = ctx.textAlign;
+        ctx.textAlign = "center";
+        ctx.fillText(label, chipX + chipW / 2, chipY + chipH / 2 + 3.5);
+        ctx.textAlign = prevAlign;
+      };
 
       // ---- crosshair
       const hov = hoverRef.current;
@@ -587,7 +788,90 @@ export function ChartView({
           ctx.lineWidth = 1;
           ctx.fillStyle = c.close >= c.open ? UP : DOWN;
           ctx.fillText(info, 10, 17);
+          drawTimeChip(x(idx), c.time);
         }
+      }
+
+      // ---- crosshair over the future blank space (no candle there yet)
+      if (hov && hov.x < plotW && spanMs > 0) {
+        const idx = Math.min(end - 1, Math.max(start, start + Math.floor(hov.x / barW)));
+        const lastC = cs[n - 1];
+        if (idx >= n && lastC) {
+          ctx.strokeStyle = "rgba(17,24,39,0.28)";
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath(); ctx.moveTo(x(idx), 0); ctx.lineTo(x(idx), h - timeAxisH); ctx.stroke();
+          ctx.setLineDash([]);
+          const d = new Date(lastC.time + (idx - (n - 1)) * spanMs);
+          const when = spanMs >= 86400000
+            ? d.toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" })
+            : `${d.toLocaleDateString("id-ID", { day: "2-digit", month: "short" })} ${d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}`;
+          ctx.font = "10px 'JetBrains Mono', monospace";
+          const tw = ctx.measureText(when).width + 12;
+          ctx.fillStyle = "rgba(255,255,255,0.95)";
+          ctx.fillRect(4, 4, tw, 18);
+          ctx.strokeStyle = "rgba(15,23,42,0.08)";
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(4, 4, tw, 18);
+          ctx.lineWidth = 1;
+          ctx.fillStyle = AXIS_TEXT;
+          ctx.fillText(when, 10, 17);
+          drawTimeChip(x(idx), d.getTime());
+        }
+      }
+
+      // ---- date & price range measurement box
+      const meas = measureRef.current;
+      if (meas) {
+        const timeOf = (idx: number): number | null => {
+          const c = cs[idx];
+          if (c) return c.time;
+          const lastC = cs[n - 1];
+          return lastC && spanMs > 0 ? lastC.time + (idx - (n - 1)) * spanMs : null;
+        };
+        const x1 = x(meas.start.idx);
+        const x2 = x(meas.end.idx);
+        const y1 = yMain(meas.start.price);
+        const y2 = yMain(meas.end.price);
+        const rx = Math.min(x1, x2);
+        const rw = Math.max(1, Math.abs(x2 - x1));
+        const ry = Math.max(0, Math.min(y1, y2));
+        const rh = Math.max(1, Math.min(mainH, Math.max(y1, y2)) - ry);
+        ctx.fillStyle = "rgba(41,98,255,0.10)";
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeStyle = "rgba(41,98,255,0.8)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.fillStyle = "rgba(41,98,255,0.9)";
+        for (const [ax, ay] of [[x1, y1], [x2, y2]] as const) {
+          ctx.beginPath();
+          ctx.arc(ax, Math.max(0, Math.min(mainH, ay)), 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        const dPrice = meas.end.price - meas.start.price;
+        const pct = meas.start.price !== 0 ? (dPrice / meas.start.price) * 100 : 0;
+        const bars = Math.abs(meas.end.idx - meas.start.idx);
+        const t1 = timeOf(meas.start.idx);
+        const t2 = timeOf(meas.end.idx);
+        const line1 = `${dPrice >= 0 ? "+" : "-"}${fmtPrice(Math.abs(dPrice))} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`;
+        const line2 = t1 != null && t2 != null
+          ? `${bars} bar · ${fmtDuration(Math.abs(t2 - t1))}`
+          : `${bars} bar`;
+        const fmtWhen = (t: number) => {
+          const d = new Date(t);
+          return spanMs >= 86400000
+            ? d.toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" })
+            : `${d.toLocaleDateString("id-ID", { day: "2-digit", month: "short" })} ${d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}`;
+        };
+        const lines = t1 != null && t2 != null ? [line1, line2, `${fmtWhen(t1)} → ${fmtWhen(t2)}`] : [line1, line2];
+        ctx.font = "10px 'JetBrains Mono', monospace";
+        const lw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 14;
+        const lh = lines.length * 13 + 8;
+        const cx = Math.max(2, Math.min(plotW - lw - 2, (x1 + x2) / 2 - lw / 2));
+        const cy = Math.max(2, Math.min(mainH - lh - 2, (y1 + y2) / 2 - lh / 2));
+        ctx.fillStyle = "rgba(17,24,39,0.92)";
+        ctx.fillRect(cx, cy, lw, lh);
+        ctx.fillStyle = "#ffffff";
+        lines.forEach((l, li) => ctx.fillText(l, cx + 7, cy + 15 + li * 13));
       }
     };
 
@@ -609,6 +893,40 @@ export function ChartView({
     // (drags were swallowed), so the gesture layer is attached directly
     // to the canvas element instead.
     const pointers = pointersRef.current;
+    // Convert a pointer position to a chart point (bar index + price)
+    // for the measurement tool, using the same geometry as draw():
+    // the main pane's padded auto-fit range, or the manual scale.
+    const pointFromEvent = (ev: PointerEvent): { idx: number; price: number } | null => {
+      const rect = canvas.getBoundingClientRect();
+      const { candles: cs, panes: subPanes } = dataRef.current;
+      const n = cs.length;
+      if (n === 0) return null;
+      const plotW = Math.max(50, rect.width - AXIS_W);
+      const count = Math.max(10, Math.min(viewRef.current.count, n));
+      const end = Math.max(count, n - viewRef.current.offset);
+      const start = end - count;
+      const barW = plotW / count;
+      const px = ev.clientX - rect.left;
+      const py = ev.clientY - rect.top;
+      const subCount = subPanes.length;
+      const subH = subCount ? Math.max(56, Math.min(110, height * 0.22)) : 0;
+      const mainH = Math.max(40, height - 18 - subH * subCount);
+      if (px < 0 || px >= plotW || py < 0 || py > mainH) return null;
+      const idx = Math.max(start, Math.min(end - 1, start + Math.round(px / barW - 0.5)));
+      let lo: number;
+      let hi: number;
+      const sc = scaleRef.current;
+      if (sc) {
+        lo = sc.center - sc.span / 2;
+        hi = sc.center + sc.span / 2;
+      } else if (autoRangeRef.current) {
+        lo = autoRangeRef.current.lo;
+        hi = autoRangeRef.current.hi;
+      } else {
+        return null;
+      }
+      return { idx, price: hi - (py / mainH) * (hi - lo) };
+    };
     const onPointerDown = (ev: PointerEvent) => {
       try { canvas.setPointerCapture(ev.pointerId); } catch { /* pointer already gone */ }
       pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
@@ -633,7 +951,33 @@ export function ChartView({
           canvas.style.cursor = "ns-resize";
           return;
         }
-        dragStartRef.current = { x: ev.clientX, offset: viewRef.current.offset };
+        if (measureModeRef.current) {
+          // Measurement tool armed: this drag draws the range box
+          // instead of panning.
+          const pt = pointFromEvent(ev);
+          if (pt) {
+            measureRef.current = { start: pt, end: pt };
+            measureDragRef.current = true;
+            setHasMeasure(true);
+            dragStartRef.current = null;
+            pinchStartRef.current = null;
+            canvas.style.cursor = "crosshair";
+            draw();
+            return;
+          }
+        }
+        // Snapshot the effective price range so the vertical part of
+        // this drag can translate it: the manual range when one is
+        // active, else the padded auto-fit range currently on screen.
+        const scNow = scaleRef.current;
+        const autoNow = autoRangeRef.current;
+        dragStartRef.current = {
+          x: ev.clientX,
+          y: ev.clientY,
+          offset: viewRef.current.offset,
+          center: scNow ? scNow.center : autoNow ? (autoNow.lo + autoNow.hi) / 2 : null,
+          span: scNow ? scNow.span : autoNow ? autoNow.hi - autoNow.lo : 0,
+        };
         pinchStartRef.current = null;
         canvas.style.cursor = "grabbing";
       } else if (pointers.size === 2) {
@@ -646,6 +990,7 @@ export function ChartView({
         }
         dragStartRef.current = null;
         scaleDragRef.current = null;
+        measureDragRef.current = false;
       }
     };
     const onPointerMove = (ev: PointerEvent) => {
@@ -656,7 +1001,10 @@ export function ChartView({
       }
       const scaleDrag = scaleDragRef.current;
       const pinch = pinchStartRef.current;
-      if (scaleDrag && pointers.size === 1 && scaleRef.current) {
+      if (measureDragRef.current && measureRef.current && pointers.size === 1) {
+        const pt = pointFromEvent(ev);
+        if (pt) measureRef.current.end = pt;
+      } else if (scaleDrag && pointers.size === 1 && scaleRef.current) {
         // Vertical axis drag: exponential rescale, anchored on the
         // price under the pointer so that price stays under the finger
         // while everything stretches (drag up) or flattens (drag down).
@@ -686,29 +1034,81 @@ export function ChartView({
           }
         }
       } else if (dragStartRef.current) {
+        const ds = dragStartRef.current;
         const { candles: cs } = dataRef.current;
         const plotW = Math.max(50, rect.width - AXIS_W);
         const barW = plotW / Math.max(10, Math.min(viewRef.current.count, Math.max(1, cs.length)));
-        const dx = ev.clientX - dragStartRef.current.x;
-        const maxOff = Math.max(0, cs.length - Math.min(viewRef.current.count, Math.max(1, cs.length)));
-        viewRef.current.offset = Math.max(0, Math.min(maxOff, dragStartRef.current.offset + Math.round(dx / barW)));
+        const dx = ev.clientX - ds.x;
+        const cnt = Math.min(viewRef.current.count, Math.max(1, cs.length));
+        const maxOff = Math.max(0, cs.length - cnt);
+        // Negative offset = panned past the latest candle into the
+        // empty future space (TradingView-style, no right-edge stop).
+        const minOff = -(cnt - 1);
+        viewRef.current.offset = Math.max(minOff, Math.min(maxOff, ds.offset + Math.round(dx / barW)));
         syncPanned();
+        // Vertical part of the same drag: translate the visible price
+        // range so the candles ride with the pointer — dragging down
+        // moves the candles down (range center rises by the dragged
+        // price distance), dragging up moves them up. The span is NOT
+        // touched: this is a shift, not the axis-drag zoom. The shift
+        // is stored in scaleRef, so it persists across live refetches
+        // until the view is reset ("Terbaru" / double-click / Home).
+        const dy = ev.clientY - ds.y;
+        // 3px dead zone: a horizontal pan with a pixel or two of
+        // vertical drift must not pin the price range by accident.
+        // The shift is computed from the total drag distance, so once
+        // past the dead zone the translation starts smoothly.
+        if (Math.abs(dy) >= 3 && ds.center != null && ds.span > 0) {
+          if (!scaleRef.current) {
+            // First vertical movement of an auto-fit chart: pin the
+            // range currently on screen as the manual range (same
+            // span, so nothing jumps), then translate it.
+            scaleRef.current = { center: ds.center, span: ds.span, base: ds.span };
+            syncScaled();
+          }
+          const subCount = dataRef.current.panes.length;
+          const subH = subCount ? Math.max(56, Math.min(110, height * 0.22)) : 0;
+          const mainH = Math.max(40, height - 18 - subH * subCount);
+          const shift = (dy / mainH) * ds.span;
+          // Generous clamp (±10 spans from the drag-start center) so
+          // a wild fling can't lose the candles entirely; the reset
+          // controls always bring them back regardless.
+          const clamped = Math.max(-10 * ds.span, Math.min(10 * ds.span, shift));
+          scaleRef.current.center = ds.center + clamped;
+        }
       }
       draw();
     };
     const endPointer = (ev: PointerEvent) => {
       pointers.delete(ev.pointerId);
       if (pointers.size === 0) {
+        if (measureDragRef.current) {
+          // Measurement finished: keep the box, disarm the tool so the
+          // next drag pans again.
+          measureDragRef.current = false;
+          setMeasureMode(false);
+        }
         dragStartRef.current = null;
         pinchStartRef.current = null;
         scaleDragRef.current = null;
-        canvas.style.cursor = "grab";
+        canvas.style.cursor = measureModeRef.current ? "crosshair" : "grab";
       } else if (pointers.size === 1) {
         pinchStartRef.current = null;
         scaleDragRef.current = null;
         const remaining = [...pointers.values()][0];
         if (remaining) {
-          dragStartRef.current = { x: remaining.x, offset: viewRef.current.offset };
+          // Re-anchor the drag on the remaining pointer with a fresh
+          // range snapshot, so a continued drag pans both directions
+          // from where the pinch left off.
+          const scNow = scaleRef.current;
+          const autoNow = autoRangeRef.current;
+          dragStartRef.current = {
+            x: remaining.x,
+            y: remaining.y,
+            offset: viewRef.current.offset,
+            center: scNow ? scNow.center : autoNow ? (autoNow.lo + autoNow.hi) / 2 : null,
+            span: scNow ? scNow.span : autoNow ? autoNow.hi - autoNow.lo : 0,
+          };
         }
       }
     };
@@ -743,7 +1143,7 @@ export function ChartView({
       canvas.removeEventListener("pointerleave", onPointerLeave);
       canvas.removeEventListener("dblclick", onDblClick);
     };
-  }, [candles, overlayPlots, panes, height]);
+  }, [candles, overlayPlots, panes, height, liquidity]);
 
   const panBtn =
     "flex h-8 w-8 items-center justify-center rounded-md border border-[var(--border)] bg-white/90 text-base leading-none text-[var(--dim)] shadow-sm";
@@ -752,9 +1152,9 @@ export function ChartView({
     <div ref={wrapRef} className="relative w-full touch-none select-none" style={{ height }}>
       <canvas
         ref={canvasRef}
-        className="block cursor-grab touch-none"
+        className={`block touch-none ${measureMode ? "cursor-crosshair" : "cursor-grab"}`}
         style={{ touchAction: "none" }}
-        aria-label="Grafik candlestick — seret untuk menggeser kanan kiri, seret sumbu harga di kanan ke atas atau bawah untuk mengubah skala harga vertikal, cubit atau roda mouse untuk zoom, klik dua kali untuk kembali ke terbaru"
+        aria-label="Grafik candlestick — seret untuk menggeser kanan kiri (bisa melewati candle terbaru ke ruang kosong di kanan) dan ke atas bawah untuk menggeser rentang harga tanpa mengubah skala, seret sumbu harga di kanan ke atas atau bawah untuk mengubah skala harga vertikal, cubit atau roda mouse untuk zoom, klik dua kali untuk kembali ke terbaru"
         tabIndex={0}
         onKeyDown={(e) => {
           if (e.key === "ArrowLeft") { e.preventDefault(); panBy(10); }
@@ -762,8 +1162,48 @@ export function ChartView({
           else if (e.key === "ArrowUp") { e.preventDefault(); scaleBy(0.85); }
           else if (e.key === "ArrowDown") { e.preventDefault(); scaleBy(1.18); }
           else if (e.key === "Home") { e.preventDefault(); resetView(); }
+          else if (e.key === "Escape") {
+            e.preventDefault();
+            if (measureMode) setMeasureMode(false);
+            else clearMeasure();
+          }
         }}
       />
+      <div className="absolute right-2 top-2 flex flex-col items-end gap-1">
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            aria-label="Ukur rentang tanggal dan harga"
+            aria-pressed={measureMode}
+            onClick={() => {
+              if (measureMode) setMeasureMode(false);
+              else { clearMeasure(); setMeasureMode(true); }
+            }}
+            className={`h-8 rounded-md border px-2 font-mono text-[11px] font-semibold shadow-sm ${
+              measureMode
+                ? "border-[var(--accent)] bg-[var(--accent)] text-black"
+                : "border-[var(--border)] bg-white/90 text-[var(--text)]"
+            }`}
+          >
+            Ukur rentang
+          </button>
+          {hasMeasure && !measureMode && (
+            <button
+              type="button"
+              aria-label="Hapus hasil pengukuran rentang"
+              onClick={clearMeasure}
+              className="h-8 rounded-md border border-[var(--border)] bg-white/90 px-2 font-mono text-[11px] font-semibold text-[var(--down)] shadow-sm"
+            >
+              ✕ Hapus
+            </button>
+          )}
+        </div>
+        {measureMode && (
+          <span className="rounded-md bg-black/70 px-2 py-1 font-mono text-[10px] text-white">
+            Seret di chart untuk mengukur
+          </span>
+        )}
+      </div>
       <div className="absolute bottom-7 left-2 flex items-center gap-1">
         <button
           type="button"
@@ -781,10 +1221,10 @@ export function ChartView({
         >
           ›
         </button>
-        {panned && (
+        {(panned || scaled) && (
           <button
             type="button"
-            aria-label="Kembali ke candle terbaru"
+            aria-label="Kembali ke candle terbaru dan posisi harga awal"
             onClick={resetView}
             className="h-8 rounded-md border border-[var(--accent)] bg-white/90 px-2 font-mono text-[11px] font-semibold text-[var(--text)] shadow-sm"
           >

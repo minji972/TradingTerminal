@@ -1,0 +1,419 @@
+//@version=6
+// Liquidity Master
+//
+// The order book, read off the chart. Resting orders sit where traders put them: stops just
+// past every swing high and swing low, and the bids and offers that showed themselves in the
+// wicks that got rejected. The script keeps every one of those pools, spends them as price
+// trades through them, lets them age out as orders get pulled, and draws what is left as a
+// depth ladder beside price: bids below in one colour, offers above in another, the longer
+// the bar the more is resting there. The biggest wall on each side is named and tracked, and
+// the panel keeps the score of how walls on this chart have held when price got to them.
+//
+// The ladder does the drawing, the walls do the reading, the record keeps the score, the
+// panel does the words, the alerts carry the events.
+
+indicator("Liquidity Master [SimpleAlgo]", "Liquidity Master [SimpleAlgo]", overlay = true, max_boxes_count = 500, max_lines_count = 50, max_labels_count = 50, max_bars_back = 500)
+
+// ───────────────────────── Settings ─────────────────────────
+
+grpE = "Liquidity"
+pivIn  = input.int(4, "Swing strength (bars)", minval = 2, maxval = 20, group = grpE, tooltip = "Stops rest just past a swing high or swing low. A swing needs this many lower highs or higher lows on each side.")
+wickIn = input.float(0.45, "Wick rejection (ATR)", minval = 0.2, maxval = 2, step = 0.05, group = grpE, tooltip = "A wick at least this long shows orders that absorbed a push. They stay on the ladder until price trades back through them.")
+halfIn = input.int(300, "Liquidity ages out over (bars)", minval = 50, maxval = 3000, step = 10, group = grpE, tooltip = "Half of a pool is gone after this many bars, because orders get pulled.")
+lookIn = input.int(1500, "Bars to compute", minval = 300, maxval = 4000, step = 100, group = grpE, tooltip = "The engine runs on the most recent bars only, to keep the chart fast.")
+
+grpL = "Ladder"
+posIn   = input.string("Over the last bars", "Ladder sits", options = ["Over the last bars", "Right of price"], group = grpL, tooltip = "Over the last bars draws the ladder across the most recent candles, like a volume profile. Right of price puts it in the empty space to the right, which needs room: drag the price scale to the left, or raise the right margin in the chart settings.")
+widthIn = input.int(30, "Ladder width (bars)", minval = 10, maxval = 100, group = grpL)
+spanIn  = input.int(300, "Ladder covers (bars)", minval = 50, maxval = 2000, step = 10, group = grpL, tooltip = "The ladder spans the price range of this many recent bars, plus a margin. Match it to how many bars you keep on screen.")
+rowsIn  = input.int(80, "Rows", minval = 20, maxval = 100, group = grpL)
+themeIn = input.string("Mint and Pink", "Colours", options = ["Mint and Pink", "Ice", "Custom"], group = grpL)
+cBidIn  = input.color(#00FFA3, "", group = grpL, inline = "c")
+cAskIn  = input.color(#FF3D71, "", group = grpL, inline = "c")
+bright  = input.int(3, "Brightness", minval = 1, maxval = 5, group = grpL)
+showWalls = input.bool(true, "Wall lines", group = grpL, inline = "w")
+showNames = input.bool(true, "Wall names", group = grpL, inline = "w")
+showPrice = input.bool(true, "Price tag", group = grpL, inline = "w", tooltip = "The price tag only shows when the ladder sits right of price, the axis already has it otherwise.")
+showPanel = input.bool(true, "Panel", group = grpL, inline = "p")
+panelPos  = input.string("Top right", "", options = ["Top left", "Top right", "Bottom left", "Bottom right"], group = grpL, inline = "p")
+panelSize = input.string("Normal", "", options = ["Small", "Normal", "Large"], group = grpL, inline = "p")
+
+[colBid, colAsk] = switch themeIn
+    "Mint and Pink" => [#00FFA3, #FF3D71]
+    "Ice"           => [#7DD3FC, #C4B5FD]
+    => [cBidIn, cAskIn]
+color colPanel = #262B38
+color colEdge  = #2A2E39
+
+// fixed rules
+int   maxEv     = 400     // pools kept at once
+int   maxRows   = 100     // ladder rows available
+float zoneATR   = 0.75    // stops sit within three quarters of an ATR past a swing
+float pivW      = 1.6     // weight of the stops past a swing
+float wickW     = 0.5     // weight of a rejection wick, times its relative volume
+int   refreshEvery = 10   // bars between wall refreshes for the record
+int   keepRec   = 10      // wall tests remembered
+float brokeATR  = 0.5     // a close this far past a wall breaks it
+float heldATR   = 0.5     // a close this far back from a wall means it held
+int   testBars  = 60      // a test is dropped after this many bars without a verdict
+int   lineBack  = 150     // how far the wall lines reach back
+float wallAt    = 0.5     // a wall must hold at least this share of the biggest row to be tracked
+
+// ───────────────────────── Inputs to the engine ─────────────────────────
+
+float atr    = math.max(nz(ta.atr(14), high - low), syminfo.mintick)
+float atrG   = math.max(nz(ta.atr(50), atr), syminfo.mintick)      // the slow one, for the ladder's geometry
+float vAvg   = ta.sma(nz(volume, 0), 50)
+bool  hasVol = not na(volume) and vAvg > 0
+float vRel   = hasVol ? math.min(volume / vAvg, 4.0) : 1.0
+float ph     = ta.pivothigh(high, pivIn, pivIn)
+float pl     = ta.pivotlow(low, pivIn, pivIn)
+float hhSince = ta.highest(high, pivIn)     // the bars after a swing high, by the time it confirms
+float llSince = ta.lowest(low, pivIn)
+bool  active = bar_index > last_bar_index - lookIn
+int   nrow   = math.min(rowsIn, maxRows)
+float hhSpan = ta.highest(high, spanIn)
+float llSpan = ta.lowest(low, spanIn)
+float margin = math.max(1.5 * atrG, 0.08 * (hhSpan - llSpan))
+float step   = math.max(math.round(((hhSpan - llSpan + 2 * margin) / nrow) / syminfo.mintick) * syminfo.mintick, syminfo.mintick)
+float base   = math.floor((llSpan - margin) / step) * step             // rows sit on a fixed grid, so they do not slide with every tick
+float brightMul = 0.4 + 0.2 * bright
+
+// ───────────────────────── The pools ─────────────────────────
+// each pool is a price zone with resting orders: which side of price it works on, its zone,
+// its weight when it was created, the bar it was created, and how far price has eaten into it
+
+var evSide = array.new_int()       // 1 above price (offers and buy stops), -1 below (bids and sell stops)
+var evP0   = array.new_float()
+var evP1   = array.new_float()
+var evW    = array.new_float()
+var evBar  = array.new_int()
+var evExt  = array.new_float()     // the furthest price has traded into the zone since it was created
+var rowS   = array.new_float(maxRows, 0.0)
+var recHeld = array.new_int()      // 1 the wall held, 0 it broke
+
+bool reachedUp = false
+bool reachedDn = false
+bool wallHeld  = false
+bool wallBroke = false
+
+dropEv(int k) =>
+    array.remove(evSide, k)
+    array.remove(evP0, k)
+    array.remove(evP1, k)
+    array.remove(evW, k)
+    array.remove(evBar, k)
+    array.remove(evExt, k)
+    k
+
+addEv(int side, float p0, float p1, float w, int atBar, float ext) =>
+    if array.size(evP0) >= maxEv
+        dropEv(0)
+    array.push(evSide, side)
+    array.push(evP0, p0)
+    array.push(evP1, p1)
+    array.push(evW, w)
+    array.push(evBar, atBar)
+    array.push(evExt, ext)
+    true
+
+buildRows() =>
+    // fills rowS with the resting liquidity per row around the current close, smoothed, and returns the biggest row
+    for r = 0 to maxRows - 1
+        array.set(rowS, r, 0.0)
+    int n = array.size(evP0)
+    if n > 0
+        for k = 0 to n - 1
+            int side = array.get(evSide, k)
+            float a0 = side == 1 ? math.max(array.get(evP0, k), array.get(evExt, k)) : array.get(evP0, k)
+            float a1 = side == 1 ? array.get(evP1, k) : math.min(array.get(evP1, k), array.get(evExt, k))
+            if a1 > a0
+                float w = array.get(evW, k) * math.pow(0.5, (bar_index - array.get(evBar, k)) / halfIn)
+                int r0 = math.max(math.floor((a0 - base) / step), 0)
+                int r1 = math.min(math.floor((a1 - base) / step), nrow - 1)
+                if r1 >= r0
+                    for r = r0 to r1
+                        float lo = base + r * step
+                        float ov = math.min(a1, lo + step) - math.max(a0, lo)
+                        if ov > 0
+                            array.set(rowS, r, array.get(rowS, r) + w * ov / (a1 - a0))
+    float peak = 0.0
+    if nrow >= 3
+        float prev = array.get(rowS, 0)
+        for r = 0 to nrow - 1
+            float cur = array.get(rowS, r)
+            float nxt = r < nrow - 1 ? array.get(rowS, r + 1) : cur
+            float sm = 0.25 * prev + 0.5 * cur + 0.25 * nxt
+            prev := cur
+            array.set(rowS, r, sm)
+            peak := math.max(peak, sm)
+    peak
+
+findWalls(float peak) =>
+    // the biggest row on each side at least 0.3 ATR away from price, the nearest real pool on each side, and the liquidity on each side
+    float upP = na
+    float upT = 0.0
+    float dnP = na
+    float dnT = 0.0
+    float nearUp = na
+    float nearDn = na
+    float sumUp = 0.0
+    float sumDn = 0.0
+    if peak > 0
+        for r = 0 to nrow - 1
+            float mid = base + (r + 0.5) * step
+            float t = array.get(rowS, r) / peak
+            if mid >= close + 0.3 * atr
+                sumUp += t
+                if t > upT
+                    upT := t
+                    upP := mid
+                if t >= 0.3 and na(nearUp)
+                    nearUp := mid
+            else if mid <= close - 0.3 * atr
+                sumDn += t
+                if t > dnT
+                    dnT := t
+                    dnP := mid
+                if t >= 0.3
+                    nearDn := mid
+    [upP, upT, dnP, dnT, nearUp, nearDn, sumUp, sumDn]
+
+pushRec(int v) =>
+    array.push(recHeld, v)
+    if array.size(recHeld) > keepRec
+        array.shift(recHeld)
+    v
+
+var float wallUpV = na      // the walls as of the last refresh, for the record
+var float wallDnV = na
+var int   testSide = 0
+var float testP = na
+var int   testBar = 0
+
+if active and barstate.isconfirmed
+    // 1. price trading through a pool spends it, and old pools are gone
+    int i = 0
+    while i < array.size(evP0)
+        int side = array.get(evSide, i)
+        bool gone = bar_index - array.get(evBar, i) > 4 * halfIn
+        if side == 1
+            float ext = math.max(array.get(evExt, i), high)
+            array.set(evExt, i, ext)
+            gone := gone or ext >= array.get(evP1, i)
+        else
+            float ext = math.min(array.get(evExt, i), low)
+            array.set(evExt, i, ext)
+            gone := gone or ext <= array.get(evP0, i)
+        if gone
+            dropEv(i)
+        else
+            i += 1
+    // 2. new pools: the stops past a swing that just confirmed, and the orders in a rejection wick
+    if not na(ph) and hhSince < ph + zoneATR * atr
+        addEv(1, ph, ph + zoneATR * atr, pivW, bar_index - pivIn, math.max(hhSince, ph))
+    if not na(pl) and llSince > pl - zoneATR * atr
+        addEv(-1, pl - zoneATR * atr, pl, pivW, bar_index - pivIn, math.min(llSince, pl))
+    float uw = high - math.max(open, close)
+    float dw = math.min(open, close) - low
+    if uw >= wickIn * atr
+        addEv(1, math.max(open, close), high, wickW * vRel, bar_index, math.max(open, close))
+    if dw >= wickIn * atr
+        addEv(-1, low, math.min(open, close), wickW * vRel, bar_index, math.min(open, close))
+    // 3. every so often, name the walls for the record
+    if bar_index % refreshEvery == 0 and array.size(evP0) >= 15
+        float pk = buildRows()
+        [u, tu, d, td, nu, nd, su, sd] = findWalls(pk)
+        wallUpV := tu >= wallAt ? u : na
+        wallDnV := td >= wallAt ? d : na
+    // 4. a wall gets tested when price reaches it: it held if price backs off, it broke if price closes through
+    if testSide == 0
+        if not na(wallUpV) and high >= wallUpV - step / 2
+            testSide := 1
+            testP := wallUpV
+            testBar := bar_index
+            wallUpV := na
+            reachedUp := true
+        else if not na(wallDnV) and low <= wallDnV + step / 2
+            testSide := -1
+            testP := wallDnV
+            testBar := bar_index
+            wallDnV := na
+            reachedDn := true
+    else
+        bool broke = testSide == 1 ? close > testP + brokeATR * atr : close < testP - brokeATR * atr
+        bool held  = testSide == 1 ? close <= testP - heldATR * atr : close >= testP + heldATR * atr
+        if broke
+            pushRec(0)
+            wallBroke := true
+            testSide := 0
+        else if held
+            pushRec(1)
+            wallHeld := true
+            testSide := 0
+        else if bar_index - testBar > testBars
+            testSide := 0
+
+// ───────────────────────── The ladder ─────────────────────────
+
+var rowBox  = array.new_box()
+var glowBox = array.new_box()
+if barstate.isfirst
+    for r = 0 to maxRows - 1
+        array.push(rowBox,  box.new(bar_index, close, bar_index, close, border_color = color.new(#000000, 100), bgcolor = color.new(#000000, 100)))
+        array.push(glowBox, box.new(bar_index, close, bar_index, close, border_color = color.new(#000000, 100), bgcolor = color.new(#000000, 100)))
+
+var line edgeLn = line.new(na, na, na, na, color = colEdge, width = 1)
+var line upLn   = line.new(na, na, na, na, color = colAsk, width = 1, style = line.style_dotted)
+var line upLn2  = line.new(na, na, na, na, color = color.new(colAsk, 72), width = 3)
+var line upLn3  = line.new(na, na, na, na, color = color.new(colAsk, 86), width = 6)
+var line dnLn   = line.new(na, na, na, na, color = colBid, width = 1, style = line.style_dotted)
+var line dnLn2  = line.new(na, na, na, na, color = color.new(colBid, 72), width = 3)
+var line dnLn3  = line.new(na, na, na, na, color = color.new(colBid, 86), width = 6)
+var label upLb  = label.new(na, na, "", style = label.style_label_right, textcolor = colAsk, size = size.normal)
+var label dnLb  = label.new(na, na, "", style = label.style_label_right, textcolor = colBid, size = size.normal)
+var label pxLb  = label.new(na, na, "", style = label.style_label_left, textcolor = #FFFFFF, size = size.small)
+
+px(float x) =>
+    syminfo.mintick >= 1 ? str.tostring(x, "#,##0") : syminfo.mintick >= 0.01 ? str.tostring(x, "#,##0.00") : str.tostring(x, format.mintick)
+
+hide(box b) =>
+    box.set_bgcolor(b, color.new(#000000, 100))
+    true
+
+float wallUp = na
+float wallDn = na
+float tUp = 0.0
+float tDn = 0.0
+float nearUpP = na
+float nearDnP = na
+float sumUp = 0.0
+float sumDn = 0.0
+
+if barstate.islast
+    float peak = buildRows()
+    [u, tu, d, td, nu, nd, su, sd] = findWalls(peak)
+    wallUp := u
+    tUp := tu
+    wallDn := d
+    tDn := td
+    nearUpP := nu
+    nearDnP := nd
+    sumUp := su
+    sumDn := sd
+    bool rightSide = posIn == "Right of price"
+    int xR = rightSide ? bar_index + 2 + widthIn : bar_index
+    int xL = xR - widthIn
+    for r = 0 to maxRows - 1
+        box bx = array.get(rowBox, r)
+        box gl = array.get(glowBox, r)
+        if r < nrow and peak > 0
+            float t = array.get(rowS, r) / peak
+            float y0 = base + r * step
+            float y1 = y0 + step
+            color col = (y0 + y1) / 2 >= close ? colAsk : colBid
+            int wd = math.max(math.round(widthIn * t), 1)
+            if t >= 0.03
+                int transp = int(math.round(82 - 65 * math.pow(t, 1.2) * brightMul))
+                box.set_lefttop(bx, xR - wd, y1 - step * 0.07)
+                box.set_rightbottom(bx, xR, y0 + step * 0.07)
+                box.set_bgcolor(bx, color.new(col, math.min(math.max(transp, rightSide ? 10 : 32), 90)))
+            else
+                hide(bx)
+            if t > 0.5
+                box.set_lefttop(gl, xR - wd - 1, y1 + step * 0.2)
+                box.set_rightbottom(gl, xR, y0 - step * 0.2)
+                box.set_bgcolor(gl, color.new(col, int(math.round(100 - 14 * t * brightMul))))
+            else
+                hide(gl)
+        else
+            hide(bx)
+            hide(gl)
+    line.set_xy1(edgeLn, xR + 1, base)
+    line.set_xy2(edgeLn, xR + 1, base + nrow * step)
+    // the walls: a dotted line back across the chart, with a soft halo
+    color cHide = color.new(#000000, 100)
+    bool vUp = showWalls and not na(wallUp)
+    bool vDn = showWalls and not na(wallDn)
+    float yUp = vUp ? wallUp : close
+    float yDn = vDn ? wallDn : close
+    for ln in array.from(upLn, upLn2, upLn3)
+        line.set_xy1(ln, bar_index - lineBack, yUp)
+        line.set_xy2(ln, xR, yUp)
+    for ln in array.from(dnLn, dnLn2, dnLn3)
+        line.set_xy1(ln, bar_index - lineBack, yDn)
+        line.set_xy2(ln, xR, yDn)
+    line.set_color(upLn,  vUp ? colAsk : cHide)
+    line.set_color(upLn2, vUp ? color.new(colAsk, 72) : cHide)
+    line.set_color(upLn3, vUp ? color.new(colAsk, 86) : cHide)
+    line.set_color(dnLn,  vDn ? colBid : cHide)
+    line.set_color(dnLn2, vDn ? color.new(colBid, 72) : cHide)
+    line.set_color(dnLn3, vDn ? color.new(colBid, 86) : cHide)
+    // the names sit left of the ladder when it has the margin to itself, and inside its right edge when it sits over the candles
+    color pill = color.new(chart.bg_color, 25)
+    bool nUp = showNames and not na(wallUp)
+    bool nDn = showNames and not na(wallDn)
+    label.set_xy(upLb, rightSide ? xL - 1 : xR, nUp ? wallUp : close)
+    label.set_xy(dnLb, rightSide ? xL - 1 : xR, nDn ? wallDn : close)
+    label.set_text(upLb, nUp ? "sell wall " + px(wallUp) : "")
+    label.set_text(dnLb, nDn ? "buy wall " + px(wallDn) : "")
+    label.set_color(upLb, nUp ? pill : cHide)
+    label.set_color(dnLb, nDn ? pill : cHide)
+    label.set_textcolor(upLb, colAsk)
+    label.set_textcolor(dnLb, colBid)
+    label.set_xy(pxLb, xR + 1, close)
+    label.set_text(pxLb, showPrice and rightSide ? px(close) : "")
+    label.set_color(pxLb, showPrice and rightSide ? pill : cHide)
+
+// ───────────────────────── Panel ─────────────────────────
+
+var table panel = na
+if showPanel and barstate.islast
+    if na(panel)
+        tablePos = switch panelPos
+            "Top left"     => position.top_left
+            "Bottom left"  => position.bottom_left
+            "Bottom right" => position.bottom_right
+            => position.top_right
+        panel := table.new(tablePos, 2, 6, bgcolor = color.new(colPanel, 15), frame_color = color.new(colPanel, 0), frame_width = 1, border_width = 0)
+    txtSize = panelSize == "Small" ? size.small : panelSize == "Large" ? size.large : size.normal
+    color txt = #D1D4DC
+    color dim = color.new(#D1D4DC, 40)
+    float dUp = na(wallUp) ? na : (wallUp - close) / atr
+    float dDn = na(wallDn) ? na : (close - wallDn) / atr
+    string upTxt = na(wallUp) ? "No wall on the ladder" : px(wallUp) + ", " + str.tostring(dUp, "0.0") + " ATR above" + (tUp >= 0.999 ? ", the biggest pool on the ladder" : "")
+    string dnTxt = na(wallDn) ? "No wall on the ladder" : px(wallDn) + ", " + str.tostring(dDn, "0.0") + " ATR below" + (tDn >= 0.999 ? ", the biggest pool on the ladder" : "")
+    float total = sumUp + sumDn
+    float shareDn = total > 0 ? sumDn / total * 100 : 50
+    string balTxt = total == 0 ? "Nothing mapped yet" : str.tostring(shareDn, "0") + "% of the resting liquidity sits below price, " + str.tostring(100 - shareDn, "0") + "% above"
+    color balClr = shareDn >= 58 ? colBid : shareDn <= 42 ? colAsk : txt
+    int nRec = array.size(recHeld)
+    int held = nRec > 0 ? int(array.sum(recHeld)) : 0
+    string recTxt = nRec == 0 ? "No wall tested yet" : "Walls held " + str.tostring(held) + " of the last " + str.tostring(nRec) + (nRec == 1 ? " test" : " tests")
+    bool testing = testSide != 0
+    float nUpD = na(nearUpP) ? na : (nearUpP - close) / atr
+    float nDnD = na(nearDnP) ? na : (close - nearDnP) / atr
+    bool nearUp = not na(nUpD) and (na(nDnD) or nUpD <= nDnD)
+    bool nearIsWall = nearUp ? (not na(wallUp) and math.abs(nearUpP - wallUp) < step) : (not na(wallDn) and math.abs(nearDnP - wallDn) < step)
+    string thick = shareDn >= 58 ? ", the thicker side is below" : shareDn <= 42 ? ", the thicker side is above" : ""
+    string read = testing ? (testSide == 1 ? "Testing the sell wall now, a close " + str.tostring(brokeATR, "0.0") + " ATR through it breaks it" : "Testing the buy wall now, a close " + str.tostring(brokeATR, "0.0") + " ATR through it breaks it") : total == 0 ? "Waiting for swings to map" : na(nearUpP) and na(nearDnP) ? "Thin on both sides, nothing in the way" : nearUp ? (nearIsWall ? "Sell wall " + str.tostring(nUpD, "0.0") + " ATR above is the first thing in the way" : "Offers " + str.tostring(nUpD, "0.0") + " ATR above are the first thing in the way, the sell wall is " + str.tostring(dUp, "0.0") + " ATR up") + thick : (nearIsWall ? "Buy wall " + str.tostring(nDnD, "0.0") + " ATR below is the first thing in the way" : "Bids " + str.tostring(nDnD, "0.0") + " ATR below are the first thing in the way, the buy wall is " + str.tostring(dDn, "0.0") + " ATR down") + thick
+    color readClr = testing ? #FFFFFF : nearUp ? colAsk : colBid
+    table.cell(panel, 0, 0, "LIQUIDITY MASTER", text_color = txt, text_size = txtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 0, px(close), text_color = dim, text_size = txtSize, text_halign = text.align_right)
+    table.cell(panel, 0, 1, "Sell wall", text_color = dim, text_size = txtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 1, upTxt, text_color = na(wallUp) ? txt : colAsk, text_size = txtSize, text_halign = text.align_right)
+    table.cell(panel, 0, 2, "Buy wall", text_color = dim, text_size = txtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 2, dnTxt, text_color = na(wallDn) ? txt : colBid, text_size = txtSize, text_halign = text.align_right)
+    table.cell(panel, 0, 3, "Balance", text_color = dim, text_size = txtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 3, balTxt, text_color = balClr, text_size = txtSize, text_halign = text.align_right)
+    table.cell(panel, 0, 4, "Walls here", text_color = dim, text_size = txtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 4, recTxt, text_color = txt, text_size = txtSize, text_halign = text.align_right)
+    table.cell(panel, 0, 5, "Read", text_color = dim, text_size = txtSize, text_halign = text.align_left)
+    table.cell(panel, 1, 5, read, text_color = readClr, text_size = txtSize, text_halign = text.align_right)
+
+// ───────────────────────── Alerts ─────────────────────────
+
+alertcondition(reachedUp, "Sell wall reached", "Liquidity Master: price reached the sell wall")
+alertcondition(reachedDn, "Buy wall reached",  "Liquidity Master: price reached the buy wall")
+alertcondition(wallHeld,  "Wall held",         "Liquidity Master: the wall held, price backed off")
+alertcondition(wallBroke, "Wall broke",        "Liquidity Master: price closed through the wall")
